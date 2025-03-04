@@ -89,7 +89,7 @@ operator = lexeme . try $ do
 
 -- | A "value" identifier: either a normal identifier or a parenthesized operator.
 valueIdentifier :: Parser String
-valueIdentifier = try identifier <|> parens operator
+valueIdentifier = try (identifier <|> parens operator)
 
 -- * Constants
 
@@ -109,7 +109,7 @@ pConstant =
       c <- anySingle
       void $ char '\''
       return $ CharConst c
-    pString = do
+    pString = lexeme $ do
       void $ char '"'
       s <- manyTill L.charLiteral (char '"')
       return $ StringConst s
@@ -143,6 +143,15 @@ typeOperators =
 pPattern :: Parser Pattern
 pPattern = E.makeExprParser pPatternTerm patternOperators
 
+pParenPattern :: Parser Pattern
+pParenPattern = do
+  void $ symbol "("
+  ps <- pPattern `sepBy` symbol ","
+  void $ symbol ")"
+  case ps of
+    [p] -> return p
+    _   -> return $ TuplePattern ps
+
 pPatternTerm :: Parser Pattern
 pPatternTerm =
   choice
@@ -153,7 +162,7 @@ pPatternTerm =
           mpat <- optional pPatternTerm
           return $ ConstructPattern con mpat,
       VarPattern <$> identifier,
-      parens pPattern,
+      try pParenPattern, 
       brackets (sepBy pPattern (symbol ";")) >>= \ps ->
         return $
           foldr
@@ -162,11 +171,21 @@ pPatternTerm =
             ps
     ]
 
+
 patternOperators :: [[E.Operator Parser Pattern]]
 patternOperators =
-  [ [E.InfixL (OrPattern <$ symbol "|")]
+  [ [ E.InfixR (do
+         void (symbol "::")
+         return (\p acc -> ConstructPattern "::" (Just (TuplePattern [p, acc])))
+       )
+    ]
+  , [ E.InfixL (try (do
+         void (symbol "|")
+         notFollowedBy (symbol "->")
+         return OrPattern))
+    ]
   ]
-
+  
 -- * Expressions
 
 -- Add a simple parser for boolean literals.
@@ -175,11 +194,22 @@ pBool = do
   b <- lexeme (string "true" <|> string "false")
   return (Identifier b)
 
+-- | Parse a parenthesized expression, which can represent either a single expression or a tuple.
+pParenExpr :: Parser Expr
+pParenExpr = do
+  void $ symbol "("
+  es <- pExpr `sepBy` symbol ","
+  void $ symbol ")"
+  case es of
+    []  -> return $ ConstantExpr (StringConst "unit")
+    [e] -> return e
+    _   -> return $ TupleExpr es
+
 -- | Parse an atom: a basic expression unit.
 pAtom :: Parser Expr
 pAtom =
   choice
-    [ try pIf,      -- if-expression is tried first
+    [ try pIf,      -- if-expression
       try pLet,     -- let-expression (with "in")
       try pLambda,  -- lambda-expression
       try pMatch,   -- match-expression
@@ -190,7 +220,7 @@ pAtom =
           return $ ConstructorExpr con mexpr,
       ConstantExpr <$> pConstant,
       Identifier <$> valueIdentifier,
-      parens pExpr,
+      pParenExpr, 
       -- List literal: use pTerm for items to avoid conflicts with infix ";"
       brackets (sepBy pTerm (symbol ";")) >>= \es ->
         return $
@@ -206,8 +236,10 @@ pTerm = foldl Application <$> pAtom <*> many pAtom
 
 -- | A postfix parser for a type annotation: [expr : ty].
 postfixTypeAnnotation :: Parser (Expr -> Expr)
-postfixTypeAnnotation = do
-  void $ symbol ":"
+postfixTypeAnnotation = try $ do
+  void (string ":")
+  notFollowedBy (char ':')
+  sc
   ty <- pTypeExpr
   return (`TypeAnnotation` ty)
 
@@ -236,12 +268,12 @@ exprOperators =
     ],
     [ E.InfixL (do { op <- choice [symbol "+", symbol "-"]; return (Application . Application (Identifier op)) })
     ],
-    [ E.InfixR (do { void (symbol "::"); return (\x y -> ConstructorExpr "::" (Just (TupleExpr [x, y]))) })
-    ],
+    [ E.InfixR (do { void (symbol "::"); return (\x y -> Application (Application (Identifier "::") x) y) })],
     [ E.InfixL (do { op <- choice [ symbol "=",
+                                      symbol "<=",
+                                      symbol ">=",
                                       symbol "<",
                                       symbol ">",
-                                      symbol "|",
                                       symbol "&",
                                       symbol "$"
                                     ]
@@ -251,8 +283,6 @@ exprOperators =
     [ E.InfixR (do { op <- symbol "&&"; return (Application . Application (Identifier op)) })
     ],
     [ E.InfixR (do { op <- symbol "||"; return (Application . Application (Identifier op)) })
-    ],
-    [ E.InfixN (do { void (symbol ","); return (\x y -> TupleExpr [x, y]) })
     ],
     [ E.InfixN (do { void (symbol ";")
                    ; return (\x y ->
@@ -300,17 +330,17 @@ pMatch = do
   void $ symbol "match"
   expr <- pExpr
   void $ symbol "with"
-  cases <- some pCase
+  optional (symbol "|") 
+  cases <- pCase `sepBy` symbol "|"
   return $ MatchExpr expr cases
 
 pCase :: Parser (Pattern, Expr)
 pCase = do
-  void $ optional (symbol "|")
   pat <- pPattern
   void $ symbol "->"
   expr <- pExpr
   return (pat, expr)
-
+  
 -- | Parse an if-expression: [if E then E [else E]].
 pIf :: Parser Expr
 pIf = try $ do
