@@ -1,400 +1,226 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module Parser
-  ( parseProgram,
-    Parser,
-  )
-where
+module Parser where
 
 import AST
-import Control.Monad (void)
-import qualified Control.Monad.Combinators.Expr as E
-import Data.Maybe (fromMaybe)
 import Data.Void
+import Control.Monad (void)
+import Control.Applicative (empty)
 import Text.Megaparsec
 import Text.Megaparsec.Char
+import Control.Monad.Combinators.Expr (Operator, makeExprParser, Operator(Prefix), Operator(InfixL))
 import qualified Text.Megaparsec.Char.Lexer as L
 
--- | Our parser type – parsing a String with no custom error type.
+-- Define the parser type: we work with strings and use Void for errors
 type Parser = Parsec Void String
 
--- * Lexical Helpers
-
--- | Consume whitespace and OCaml-style nested comments.
+-- Space consumer: skips whitespace
 sc :: Parser ()
-sc = L.space space1 (L.skipBlockCommentNested "(*" "*)") empty
+sc = skipMany (char ' '  <|> char '\t')
 
--- | Parse a lexeme and consume trailing space.
+-- Lexeme and symbol parsers that take whitespace into account
 lexeme :: Parser a -> Parser a
 lexeme = L.lexeme sc
 
--- | Parse a fixed string and consume trailing space.
 symbol :: String -> Parser String
 symbol = L.symbol sc
 
--- | Parse something between parentheses.
+-- Wrapper for parentheses
 parens :: Parser a -> Parser a
 parens = between (symbol "(") (symbol ")")
 
--- | Parse something between brackets.
-brackets :: Parser a -> Parser a
-brackets = between (symbol "[") (symbol "]")
-
--- * Identifiers and Operators
-
+-- List of reserved words (they cannot be used as identifiers)
 reservedWords :: [String]
 reservedWords =
-  [ "true",
-    "false",
-    "match",
-    "with",
-    "let",
-    "rec",
-    "and",
-    "in",
-    "type",
-    "function",
-    "fun",
-    "if",
-    "then",
-    "else"
+  [ "let", "in", "if", "then", "else", "fun", "rec"
+  , "match", "with", "true", "false", "int", "bool", "and"
   ]
 
--- | A general identifier (for variables, etc.) that is not a keyword.
+-- Identifier parser: starts with a letter or '_' and then letters, digits, '_' or '''
 identifier :: Parser String
-identifier = lexeme . try $ do
-  x <- (:) <$> (letterChar <|> char '_')
-           <*> many (alphaNumChar <|> char '_' <|> char '\'')
-  if x `elem` reservedWords
-    then fail $ "keyword " ++ show x ++ " cannot be used as an identifier"
-    else return x
-
--- | A capitalized identifier (used for constructors).
-capitalized :: Parser String
-capitalized = lexeme . try $ do
-  x <- (:) <$> upperChar <*> many (alphaNumChar <|> char '_' <|> char '\'')
-  if x `elem` reservedWords
-    then fail $ "keyword " ++ show x ++ " cannot be used as a constructor"
-    else return x
-
--- | An operator identifier.
-operator :: Parser String
-operator = lexeme . try $ do
-  first <- satisfy (`elem` ("$&*+-/=<>@^|%~!?:." :: String))
-  rest  <- many (satisfy (`elem` ("$&*+-/=<>@^|%~!?:." :: String)))
-  let op = first : rest
-  if op `elem` ["|", "->"]
-    then fail "operator reserved as keyword"
-    else return op
-
--- | A "value" identifier: either a normal identifier or a parenthesized operator.
-valueIdentifier :: Parser String
-valueIdentifier = try (identifier <|> parens operator)
-
--- * Constants
-
-pConstant :: Parser Constant
-pConstant =
-  choice
-    [ pInt,
-      pChar,
-      pString
-    ]
+identifier = (lexeme . try) (p >>= check)
   where
-    pInt = do
-      n <- lexeme L.decimal
-      return $ IntConst n
-    pChar = do
-      void $ char '\''
-      c <- anySingle
-      void $ char '\''
-      return $ CharConst c
-    pString = lexeme $ do
-      void $ char '"'
-      s <- manyTill L.charLiteral (char '"')
-      return $ StringConst s
+    p = (:) <$> (letterChar <|> char '_')
+            <*> many (alphaNumChar <|> oneOf ("_'" :: String))
+    check x = if x `elem` reservedWords
+              then fail $ "keyword " ++ show x ++ " cannot be an identifier"
+              else return x
 
--- * Type Expressions
+-- Parser for constants: integer and boolean literals
+parseConstant :: Parser Constant
+parseConstant = IntConst <$> lexeme L.decimal
+            <|> BoolConst True  <$ symbol "true"
+            <|> BoolConst False <$ symbol "false"
 
-pTypeExpr :: Parser TypeExpr
-pTypeExpr = E.makeExprParser pTypeTerm typeOperators
+-- Parser for types
+parseType :: Parser TypeExpr
+parseType = makeFunctionType
+  where
+    parseTypeAtom =
+           (symbol "int"  >> return TypeInt)
+       <|> (symbol "bool" >> return TypeBool)
+       <|> TypeVar <$> identifier
+       <|> parens parseType
+    -- Function types are right-associative and use "->" as the arrow
+    makeFunctionType = do
+      t <- parseTypeAtom
+      rest <- optional (symbol "->" *> parseType)
+      case rest of
+        Just t' -> return (TypeFunc t t')
+        Nothing -> return t
 
-pTypeTerm :: Parser TypeExpr
-pTypeTerm =
-  choice
-    [ TypeVar <$> (char '\'' *> identifier),
-      try $ do
-        con <- identifier
-        args <- optional (parens (pTypeExpr `sepBy1` symbol ","))
-        return $ TypeConstructor con (fromMaybe [] args),
-      parens pTypeExpr
-    ]
+-- Parser for patterns
+parsePattern :: Parser Pattern
+parsePattern = do
+  p <- choice
+         [ Wildcard <$ symbol "_"                           -- _ → Wildcard
+         , ConstPattern <$> try parseConstant                -- constant → ConstPattern
+         , VarPattern <$> identifier                        -- identifier → VarPattern
+         , parens parsePattern                              -- parentheses
+         ]
+  -- If a type annotation follows the pattern, wrap it in TypePattern
+  option p (do { _ <- symbol ":"; TypePattern p <$> parseType; })
 
-typeOperators :: [[E.Operator Parser TypeExpr]]
-typeOperators =
-  [ [ E.InfixR (symbol "->" >> return TypeFunc)
-    ],
-    [ E.InfixN (symbol "*" >> return (\x y -> TypeTuple [x, y]))
-    ]
-  ]
+-- Parsers for expressions
+parseConstantExpr :: Parser Expr
+parseConstantExpr = ConstantExpr <$> parseConstant
 
--- * Patterns
+parseIdentifierExpr :: Parser Expr
+parseIdentifierExpr = Identifier <$> identifier
 
-pPattern :: Parser Pattern
-pPattern = E.makeExprParser pPatternTerm patternOperators
+parseLambdaExpr :: Parser Expr
+parseLambdaExpr = do
+  _    <- symbol "fun"
+  pats <- some parsePattern
+  _    <- symbol "->"
+  Lambda pats <$> parseExpr
 
-pParenPattern :: Parser Pattern
-pParenPattern = do
-  void $ symbol "("
-  ps <- pPattern `sepBy` symbol ","
-  void $ symbol ")"
-  case ps of
-    [p] -> return p
-    _   -> return $ TuplePattern ps
-
-pPatternTerm :: Parser Pattern
-pPatternTerm =
-  choice
-    [ Wildcard <$ symbol "_",
-      try (ConstPattern <$> pConstant),
-      try $ do
-          con <- capitalized
-          mpat <- optional pPatternTerm
-          return $ ConstructPattern con mpat,
-      VarPattern <$> identifier,
-      try pParenPattern, 
-      brackets (sepBy pPattern (symbol ";")) >>= \ps ->
-        return $
-          foldr
-            (\p acc -> ConstructPattern "::" (Just (TuplePattern [p, acc])))
-            (ConstructPattern "[]" Nothing)
-            ps
-    ]
-
-
-patternOperators :: [[E.Operator Parser Pattern]]
-patternOperators =
-  [ [ E.InfixR (do
-         void (symbol "::")
-         return (\p acc -> ConstructPattern "::" (Just (TuplePattern [p, acc])))
-       )
-    ]
-  , [ E.InfixL (try (do
-         void (symbol "|")
-         notFollowedBy (symbol "->")
-         return OrPattern))
-    ]
-  ]
-  
--- * Expressions
-
--- Add a simple parser for boolean literals.
-pBool :: Parser Expr
-pBool = do
-  b <- lexeme (string "true" <|> string "false")
-  return (Identifier b)
-
--- | Parse a parenthesized expression, which can represent either a single expression or a tuple.
-pParenExpr :: Parser Expr
-pParenExpr = do
-  void $ symbol "("
-  es <- pExpr `sepBy` symbol ","
-  void $ symbol ")"
-  case es of
-    []  -> return $ ConstantExpr (StringConst "unit")
-    [e] -> return e
-    _   -> return $ TupleExpr es
-
--- | Parse an atom: a basic expression unit.
-pAtom :: Parser Expr
-pAtom =
-  choice
-    [ try pIf,      -- if-expression
-      try pLet,     -- let-expression (with "in")
-      try pLambda,  -- lambda-expression
-      try pMatch,   -- match-expression
-      pBool,        -- boolean literals "true" or "false"
-      try $ do      -- constructor application
-          con <- capitalized
-          mexpr <- optional pAtom
-          return $ ConstructorExpr con mexpr,
-      ConstantExpr <$> pConstant,
-      Identifier <$> valueIdentifier,
-      pParenExpr, 
-      -- List literal: use pTerm for items to avoid conflicts with infix ";"
-      brackets (sepBy pTerm (symbol ";")) >>= \es ->
-        return $
-          foldr
-            (Application . Application (Identifier "::"))
-            (ConstructorExpr "[]" Nothing)
-            es
-    ]
-
--- | Parse a term by combining a sequence of atoms into left-associative application.
-pTerm :: Parser Expr
-pTerm = foldl Application <$> pAtom <*> many pAtom
-
--- | A postfix parser for a type annotation: [expr : ty].
-postfixTypeAnnotation :: Parser (Expr -> Expr)
-postfixTypeAnnotation = try $ do
-  void (string ":")
-  notFollowedBy (char ':')
-  sc
-  ty <- pTypeExpr
-  return (`TypeAnnotation` ty)
-
--- | Parse a term with optional type annotations.
-pTermWithAnnotation :: Parser Expr
-pTermWithAnnotation = do
-  expr <- pTerm
-  as <- many postfixTypeAnnotation
-  return $ foldl (\e f -> f e) expr as
-
--- | Parse expressions using an operator table.
-pExpr :: Parser Expr
-pExpr = E.makeExprParser pTermWithAnnotation exprOperators
-
-exprOperators :: [[E.Operator Parser Expr]]
-exprOperators =
-  [ [ E.Prefix (do { void (symbol "!"); return (Application (Identifier "!")) }),
-      E.Prefix (do
-                  op <- choice [symbol "-", symbol "+"]
-                  return (Application (Identifier ("~" ++ op)))
-                )
-    ],
-    [ E.InfixR (do { op <- symbol "**"; return (Application . Application (Identifier op)) })
-    ],
-    [ E.InfixL (do { op <- choice [symbol "*", symbol "/", symbol "%"]; return (Application . Application (Identifier op)) })
-    ],
-    [ E.InfixL (do { op <- choice [symbol "+", symbol "-"]; return (Application . Application (Identifier op)) })
-    ],
-    [ E.InfixR (do { void (symbol "::"); return (\x y -> Application (Application (Identifier "::") x) y) })],
-    [ E.InfixL (do { op <- choice [ symbol "=",
-                                      symbol "<=",
-                                      symbol ">=",
-                                      symbol "<",
-                                      symbol ">",
-                                      symbol "&",
-                                      symbol "$"
-                                    ]
-                   ; return (Application . Application (Identifier op))
-                 })
-    ],
-    [ E.InfixR (do { op <- symbol "&&"; return (Application . Application (Identifier op)) })
-    ],
-    [ E.InfixR (do { op <- symbol "||"; return (Application . Application (Identifier op)) })
-    ],
-    [ E.InfixN (do { void (symbol ";")
-                   ; return (\x y ->
-                              case x of
-                                SequenceExpr xs -> SequenceExpr (xs ++ [y])
-                                _ -> SequenceExpr [x, y])
-                 })
-    ]
-  ]
-
--- * Let, Lambda, Match, and If Expressions
-
--- | Parse a let-expression (with an "in" clause), e.g. [let x = 42 in x].
-pLet :: Parser Expr
-pLet = do
-  void $ symbol "let"
-  isRec <- (True <$ symbol "rec") <|> return False
-  bindings <- pBinding `sepBy1` symbol "and"
-  void $ symbol "in"
-  body <- pExpr
-  return $ if isRec then LetRecBinding bindings body
-                    else LetBinding bindings body
-
-pBinding :: Parser (Pattern, Expr)
-pBinding = do
-  pat <- pPattern
-  -- Use a simpler parser for parameters (simple identifiers)
-  params <- many (VarPattern <$> identifier)
-  void $ symbol "="
-  expr <- pExpr
-  let rhs = if null params then expr else Lambda params expr
-  return (pat, rhs)
-
--- | Parse a lambda-expression: [fun P1 P2 ... -> E].
-pLambda :: Parser Expr
-pLambda = do
-  void $ symbol "fun"
-  args <- some pPattern
-  void $ symbol "->"
-  Lambda args <$> pExpr
-
--- | Parse a match-expression: [match E with | P1 -> E1 | ...].
-pMatch :: Parser Expr
-pMatch = do
-  void $ symbol "match"
-  expr <- pExpr
-  void $ symbol "with"
-  optional (symbol "|") 
-  cases <- pCase `sepBy` symbol "|"
-  return $ MatchExpr expr cases
-
-pCase :: Parser (Pattern, Expr)
-pCase = do
-  pat <- pPattern
-  void $ symbol "->"
-  expr <- pExpr
+parseBinding :: Parser (Pattern, Expr)
+parseBinding = do
+  pat  <- parsePattern
+  _    <- symbol "="
+  expr <- parseExpr
   return (pat, expr)
-  
--- | Parse an if-expression: [if E then E [else E]].
-pIf :: Parser Expr
-pIf = try $ do
-  void $ symbol "if"
-  cond <- pExpr
-  void $ symbol "then"
-  trueBranch <- pExpr
-  elseBranch <- optional (symbol "else" *> pExpr)
-  return $ IfExpr cond trueBranch elseBranch
 
--- * Top-Level Items
+parseLetExpr :: Parser Expr
+parseLetExpr = do
+  _       <- symbol "let"
+  recFlag <- optional (symbol "rec")
+  binding <- parseBinding
+  bindings <- many (symbol "and" *> parseBinding)
+  _       <- symbol "in"
+  body    <- parseExpr
+  let allBindings = binding : bindings
+  return $ case recFlag of
+    Just _  -> LetRecBinding allBindings body
+    Nothing -> LetBinding allBindings body
 
--- | Top-level items: type definitions, let-expressions, or evaluation expressions.
-pTopLevel :: Parser TopLevelItem
-pTopLevel =
-  choice
-    [ try pTypeDef,
-      try (EvalExpr <$> pLet), 
-      try pLetTop,
-      EvalExpr <$> pExpr
+parseIfExpr :: Parser Expr
+parseIfExpr = do
+  _       <- symbol "if"
+  cond    <- parseExpr
+  _       <- symbol "then"
+  thn     <- parseExpr
+  elseExp <- optional (symbol "else" *> parseExpr)
+  return $ IfExpr cond thn elseExp
+
+parseMatchExpr :: Parser Expr
+parseMatchExpr = do
+  _     <- symbol "match"
+  expr  <- parseExpr
+  _     <- symbol "with"
+  cases <- some parseCase
+  return $ MatchExpr expr cases
+  where
+    parseCase = do
+      optional (symbol "|")
+      pat  <- parsePattern
+      _    <- symbol "->"
+      expr <- parseExpr
+      return (pat, expr)
+
+-- Postfix handling for type annotations in expressions
+withTypeAnnotation :: Expr -> Parser Expr
+withTypeAnnotation e =
+      (do { _ <- symbol ":"; t <- parseType; withTypeAnnotation (TypeAnnotation e t) })
+  <|> return e
+
+-- Factor – the basic unit without function application
+factor :: Parser Expr
+factor = choice
+  [ parens parseExpr
+  , parseLambdaExpr
+  , parseLetExpr
+  , parseIfExpr
+  , parseMatchExpr
+  , parseConstantExpr
+  , parseIdentifierExpr
+  ]
+
+-- Term – a factor with possible function application chain and postfix type annotations
+term :: Parser Expr
+term = do
+  f    <- factor
+  args <- many factor
+  let app = if null args then f else Application f args
+  withTypeAnnotation app
+
+-- Operators
+-- Function for binary operators: the result is an application of the operator as a function.
+binOp :: String -> Expr -> Expr -> Expr
+binOp op x y = Application (Identifier op) [x, y]
+
+-- Function for unary operators: the result is an application of the operator (prefixed with "U") to the argument.
+unOp :: String -> Expr -> Expr
+unOp op x = Application (Identifier ("U" ++ op)) [x]
+
+-- Define the operator table with appropriate precedences and associativity
+operatorTable :: [[Operator Parser Expr]]
+operatorTable =
+  [ [ prefix "not" (unOp "not")
+    , prefix "+"   (unOp "+")
+    , prefix "-"   (unOp "-")
     ]
+  , [ binary "*"   (binOp "*")
+    , binary "/"   (binOp "/")
+    , binary "%"   (binOp "%")
+    ]
+  , [ binary "+"   (binOp "+")
+    , binary "-"   (binOp "-")
+    ]
+  , [ binary ">"   (binOp ">")
+    , binary ">="  (binOp ">=")
+    , binary "<"   (binOp "<")
+    , binary "<="  (binOp "<=")
+    ]
+  , [ binary "=="  (binOp "==")
+    , binary "!="  (binOp "!=")
+    ]
+  , [ binary "&&"  (binOp "&&") ]
+  , [ binary "||"  (binOp "||") ]
+  ]
+  where
+    binary name f = InfixL (try (f <$ symbol name))
+    prefix name f = Prefix (try (f <$ symbol name))
 
--- | Parse a type definition.
-pTypeDef :: Parser TopLevelItem
-pTypeDef = do
-  void $ symbol "type"
-  params <- many (char '\'' *> identifier)
-  tyId   <- identifier
-  void $ symbol "="
-  variants <- pConstructorDecl `sepBy1` symbol "|"
-  return $ TypeDef (TypeDeclaration tyId params variants)
+-- The main expression parser using the operator table
+parseExpr :: Parser Expr
+parseExpr = makeExprParser term operatorTable
 
-pConstructorDecl :: Parser ConstructorDecl
-pConstructorDecl = do
-  con <- capitalized
-  mType <- optional (symbol "of" *> pTypeExpr)
-  return $ ConstructorDecl con mType
+-- Parsers for top-level constructs
+parseTopLevelItem :: Parser TopLevelItem
+parseTopLevelItem =
+      try (do
+         _       <- symbol "let"
+         recFlag <- optional (symbol "rec")
+         binding <- parseBinding
+         bindings <- many (symbol "and" *> parseBinding)
+         let allBindings = binding : bindings
+         return $ case recFlag of
+           Just _  -> LetRecBindingItem allBindings
+           Nothing -> LetBindingItem allBindings)
+  <|> EvalExpr <$> parseExpr
 
--- | Parse a top-level let binding (without an "in" clause).
--- If "in" follows, it is parsed as a let-expression.
-pLetTop :: Parser TopLevelItem
-pLetTop = try $ do
-  void $ symbol "let"
-  isRec <- (True <$ symbol "rec") <|> return False
-  bindings <- pBinding `sepBy1` symbol "and"
-  notFollowedBy (lookAhead (symbol "in"))
-  return $ if isRec then LetRecBindingItem bindings else LetBindingItem bindings
-
--- | A program is a sequence of top-level items (optionally separated by ";;").
-pProgram :: Parser Program
-pProgram = sc *> many (pTopLevel <* optional (symbol ";;")) <* eof
-
--- * Exported Entry Point
-
--- | Parse an entire program from a String.
-parseProgram :: String -> Either (ParseErrorBundle String Void) Program
-parseProgram = runParser pProgram ""
+-- Parser for a program: a sequence of top-level items until end of input
+parseProgram :: Parser [TopLevelItem]
+parseProgram = sepEndBy parseTopLevelItem newline <* eof
