@@ -1,87 +1,104 @@
 {-# LANGUAGE OverloadedStrings #-}
-
 module Parser where
 
 import AST
 import Data.Void
 import Control.Monad (void)
-import Control.Applicative (empty)
 import Text.Megaparsec
 import Text.Megaparsec.Char
-import Control.Monad.Combinators.Expr (Operator, makeExprParser, Operator(Prefix), Operator(InfixL))
+import Control.Monad.Combinators.Expr (Operator (..), makeExprParser)
 import qualified Text.Megaparsec.Char.Lexer as L
 
--- Define the parser type: we work with strings and use Void for errors
+-- | The parser type.
 type Parser = Parsec Void String
 
--- Space consumer: skips whitespace
-sc :: Parser ()
-sc = skipMany (char ' '  <|> char '\t')
+------------------------------------------------------------------------------
+-- Whitespace and Lexeme Helpers
+------------------------------------------------------------------------------
 
--- Lexeme and symbol parsers that take whitespace into account
+-- Internal whitespace: only spaces and tabs.
+sc :: Parser ()
+sc = skipMany (oneOf (" \t" :: String))
+
+-- Layout whitespace: spaces, tabs, and newlines.
+scn :: Parser ()
+scn = skipMany (oneOf (" \t\n" :: String))
+
+-- Lexeme using internal whitespace.
 lexeme :: Parser a -> Parser a
 lexeme = L.lexeme sc
 
-symbol :: String -> Parser String
-symbol = L.symbol sc
+-- Symbols using internal or layout whitespace.
+symbol, symboln :: String -> Parser String
+symbol  = L.symbol sc
+symboln = L.symbol scn
 
--- Wrapper for parentheses
+-- Parenthesized parser.
 parens :: Parser a -> Parser a
 parens = between (symbol "(") (symbol ")")
 
--- List of reserved words (they cannot be used as identifiers)
+------------------------------------------------------------------------------
+-- Identifiers and Reserved Words
+------------------------------------------------------------------------------
+
 reservedWords :: [String]
 reservedWords =
   [ "let", "in", "if", "then", "else", "fun", "rec"
   , "match", "with", "true", "false", "int", "bool", "and"
   ]
 
--- Identifier parser: starts with a letter or '_' and then letters, digits, '_' or '''
 identifier :: Parser String
-identifier = (lexeme . try) (p >>= check)
-  where
-    p = (:) <$> (letterChar <|> char '_')
-            <*> many (alphaNumChar <|> oneOf ("_'" :: String))
-    check x = if x `elem` reservedWords
-              then fail $ "keyword " ++ show x ++ " cannot be an identifier"
-              else return x
+identifier = lexeme (try $ do
+  x <- (:) <$> (letterChar <|> char '_')
+           <*> many (alphaNumChar <|> oneOf ("_'" :: String))
+  if x `elem` reservedWords
+    then fail $ "keyword " ++ show x ++ " cannot be an identifier"
+    else return x)
 
--- Parser for constants: integer and boolean literals
+------------------------------------------------------------------------------
+-- Constants and Types
+------------------------------------------------------------------------------
+
 parseConstant :: Parser Constant
-parseConstant = IntConst <$> lexeme L.decimal
-            <|> BoolConst True  <$ symbol "true"
-            <|> BoolConst False <$ symbol "false"
+parseConstant = lexeme $ choice
+  [ IntConst <$> L.decimal
+  , BoolConst True  <$ symbol "true"
+  , BoolConst False <$ symbol "false"
+  ]
 
--- Parser for types
 parseType :: Parser TypeExpr
 parseType = makeFunctionType
   where
-    parseTypeAtom =
-           (symbol "int"  >> return TypeInt)
-       <|> (symbol "bool" >> return TypeBool)
-       <|> TypeVar <$> identifier
-       <|> parens parseType
-    -- Function types are right-associative and use "->" as the arrow
+    parseTypeAtom :: Parser TypeExpr
+    parseTypeAtom = choice
+      [ symbol "int"  >> return TypeInt
+      , symbol "bool" >> return TypeBool
+      , TypeVar <$> identifier
+      , parens parseType
+      ]
     makeFunctionType = do
       t <- parseTypeAtom
-      rest <- optional (symbol "->" *> parseType)
-      case rest of
-        Just t' -> return (TypeFunc t t')
-        Nothing -> return t
+      (symbol "->" *> (TypeFunc t <$> parseType)) <|> return t
 
--- Parser for patterns
+------------------------------------------------------------------------------
+-- Patterns
+------------------------------------------------------------------------------
+
 parsePattern :: Parser Pattern
 parsePattern = do
-  p <- choice
-         [ Wildcard <$ symbol "_"                           -- _ → Wildcard
-         , ConstPattern <$> try parseConstant                -- constant → ConstPattern
-         , VarPattern <$> identifier                        -- identifier → VarPattern
-         , parens parsePattern                              -- parentheses
-         ]
-  -- If a type annotation follows the pattern, wrap it in TypePattern
-  option p (do { _ <- symbol ":"; TypePattern p <$> parseType; })
+  base <- choice
+    [ Wildcard <$ symbol "_"
+    , try (ConstPattern <$> parseConstant)
+    , VarPattern <$> identifier
+    , parens parsePattern
+    ]
+  -- Optionally attach a type annotation to the pattern.
+  (symbol ":" *> (TypePattern base <$> parseType)) <|> return base
 
--- Parsers for expressions
+------------------------------------------------------------------------------
+-- Expressions: Constants, Identifiers, and Lambda/Let/If/Match
+------------------------------------------------------------------------------
+
 parseConstantExpr :: Parser Expr
 parseConstantExpr = ConstantExpr <$> parseConstant
 
@@ -93,12 +110,14 @@ parseLambdaExpr = do
   _    <- symbol "fun"
   pats <- some parsePattern
   _    <- symbol "->"
-  Lambda pats <$> parseExpr
+  scn
+  body <- parseExpr
+  return (Lambda pats body)
 
 parseBinding :: Parser (Pattern, Expr)
 parseBinding = do
   pat  <- parsePattern
-  _    <- symbol "="
+  _    <- symboln "="
   expr <- parseExpr
   return (pat, expr)
 
@@ -106,11 +125,12 @@ parseLetExpr :: Parser Expr
 parseLetExpr = do
   _       <- symbol "let"
   recFlag <- optional (symbol "rec")
-  binding <- parseBinding
-  bindings <- many (symbol "and" *> parseBinding)
-  _       <- symbol "in"
+  firstB  <- parseBinding
+  restBs  <- many (symboln "and" *> parseBinding)
+  _       <- symboln "in"
+  scn
   body    <- parseExpr
-  let allBindings = binding : bindings
+  let allBindings = firstB : restBs
   return $ case recFlag of
     Just _  -> LetRecBinding allBindings body
     Nothing -> LetBinding allBindings body
@@ -126,28 +146,36 @@ parseIfExpr = do
 
 parseMatchExpr :: Parser Expr
 parseMatchExpr = do
-  _     <- symbol "match"
-  expr  <- parseExpr
-  _     <- symbol "with"
-  cases <- some parseCase
+  _    <- symbol "match"
+  expr <- parseExpr
+  _    <- symbol "with"
+  scn
+  cases <- some parseMatchCase
   return $ MatchExpr expr cases
   where
-    parseCase = do
-      optional (symbol "|")
+    parseMatchCase :: Parser (Pattern, Expr)
+    parseMatchCase = do
+      scn
+      _ <- optional (symbol "|" )  -- fixed: binding the result to _
       pat  <- parsePattern
       _    <- symbol "->"
+      scn
       expr <- parseExpr
       return (pat, expr)
 
--- Postfix handling for type annotations in expressions
+-- Allow chaining of type annotations.
 withTypeAnnotation :: Expr -> Parser Expr
 withTypeAnnotation e =
       (do { _ <- symbol ":"; t <- parseType; withTypeAnnotation (TypeAnnotation e t) })
   <|> return e
 
--- Factor – the basic unit without function application
-factor :: Parser Expr
-factor = choice
+------------------------------------------------------------------------------
+-- Operator Handling: Prefix and Binary Operators
+------------------------------------------------------------------------------
+
+-- Atom: the smallest unit.
+atom :: Parser Expr
+atom = choice
   [ parens parseExpr
   , parseLambdaExpr
   , parseLetExpr
@@ -157,31 +185,35 @@ factor = choice
   , parseIdentifierExpr
   ]
 
--- Term – a factor with possible function application chain and postfix type annotations
+-- Prefix operators as a standalone parser.
+prefixOperator :: Parser (Expr -> Expr)
+prefixOperator = choice
+  [ symbol "not" *> pure (unOp "not")
+  , symbol "+"   *> pure (unOp "+")
+  , symbol "-"   *> pure (unOp "-")
+  ]
+
+-- TERM: handles prefix operators and function application.
 term :: Parser Expr
 term = do
-  f    <- factor
-  args <- many factor
-  let app = if null args then f else Application f args
-  withTypeAnnotation app
+  preOps <- many (try prefixOperator)
+  base   <- atom
+  args   <- many (sc *> atom)
+  let applied = if null args then base else Application base args
+      expr    = foldr ($) applied preOps
+  withTypeAnnotation expr
 
--- Operators
--- Function for binary operators: the result is an application of the operator as a function.
+-- Helpers for binary and unary operator application.
 binOp :: String -> Expr -> Expr -> Expr
 binOp op x y = Application (Identifier op) [x, y]
 
--- Function for unary operators: the result is an application of the operator (prefixed with "U") to the argument.
 unOp :: String -> Expr -> Expr
 unOp op x = Application (Identifier ("U" ++ op)) [x]
 
--- Define the operator table with appropriate precedences and associativity
+-- Table for binary operators with their precedence.
 operatorTable :: [[Operator Parser Expr]]
 operatorTable =
-  [ [ prefix "not" (unOp "not")
-    , prefix "+"   (unOp "+")
-    , prefix "-"   (unOp "-")
-    ]
-  , [ binary "*"   (binOp "*")
+  [ [ binary "*"   (binOp "*")
     , binary "/"   (binOp "/")
     , binary "%"   (binOp "%")
     ]
@@ -201,26 +233,39 @@ operatorTable =
   ]
   where
     binary name f = InfixL (try (f <$ symbol name))
-    prefix name f = Prefix (try (f <$ symbol name))
 
--- The main expression parser using the operator table
+-- Main expression parser using the operator table.
 parseExpr :: Parser Expr
 parseExpr = makeExprParser term operatorTable
 
--- Parsers for top-level constructs
+------------------------------------------------------------------------------
+-- Top-Level Items and Programs
+------------------------------------------------------------------------------
+
+parseTopLevelLet :: Parser TopLevelItem
+parseTopLevelLet = do
+  _       <- symbol "let"
+  recFlag <- optional (symbol "rec")
+  firstB  <- parseBinding
+  restBs  <- many (symboln "and" *> parseBinding)
+  -- Allow an optional 'in' clause that we ignore in top-level let.
+  _ <- optional (symboln "in" *> scn *> parseExpr)  -- fixed: bind the result to _
+  lookAhead (void newline <|> eof)
+  let allBindings = firstB : restBs
+  return $ case recFlag of
+    Just _  -> LetRecBindingItem allBindings
+    Nothing -> LetBindingItem allBindings
+
+parseTopLevelExpr :: Parser TopLevelItem
+parseTopLevelExpr = do
+  expr <- parseExpr
+  lookAhead (void newline <|> eof)
+  return (EvalExpr expr)
+
 parseTopLevelItem :: Parser TopLevelItem
 parseTopLevelItem =
-      try (do
-         _       <- symbol "let"
-         recFlag <- optional (symbol "rec")
-         binding <- parseBinding
-         bindings <- many (symbol "and" *> parseBinding)
-         let allBindings = binding : bindings
-         return $ case recFlag of
-           Just _  -> LetRecBindingItem allBindings
-           Nothing -> LetBindingItem allBindings)
-  <|> EvalExpr <$> parseExpr
+  (lookAhead (symbol "let") *> parseTopLevelLet)
+  <|> parseTopLevelExpr
 
--- Parser for a program: a sequence of top-level items until end of input
 parseProgram :: Parser [TopLevelItem]
-parseProgram = sepEndBy parseTopLevelItem newline <* eof
+parseProgram = scn *> sepEndBy parseTopLevelItem (some newline) <* eof
